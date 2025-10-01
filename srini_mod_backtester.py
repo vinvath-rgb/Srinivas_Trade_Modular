@@ -1,6 +1,6 @@
 # srini_mod_backtester.py
 
-def run(config=None):
+def run(config=None) :
     """
     Entry point called by streamlit_app.
     """
