@@ -7,9 +7,16 @@ import pandas as pd
 from .indicators import sma, rsi
 from .sizing import target_vol_leverage, position
 
-StrategyName = Literal["SMA Crossover", "RSI Mean Reversion"]
+StrategyName = Literal["SMA Crossover", "RSI Mean Reversion", "SMA+RSI (Composite)"]
 
-def _signal_sma(df: pd.DataFrame, fast: int = 20, slow: int = 100, long_only: bool = True) -> pd.Series:
+# ---------- signal builders ----------
+
+def _signal_sma(
+    df: pd.DataFrame,
+    fast: int = 20,
+    slow: int = 100,
+    long_only: bool = True
+) -> pd.Series:
     px = df["Adj Close"]
     f = sma(px, fast)
     s = sma(px, slow)
@@ -18,17 +25,64 @@ def _signal_sma(df: pd.DataFrame, fast: int = 20, slow: int = 100, long_only: bo
         sig = np.where(f > s, 1.0, 0.0)
     return pd.Series(sig, index=px.index, name="signal")
 
-def _signal_rsi(df: pd.DataFrame, lookback: int = 14, buy_lt: float = 30, sell_gt: float = 70, long_only: bool = True) -> pd.Series:
+
+def _signal_rsi(
+    df: pd.DataFrame,
+    lookback: int = 14,
+    buy_lt: float = 30,
+    sell_gt: float = 70,
+    long_only: bool = True
+) -> pd.Series:
     px = df["Adj Close"]
     r = rsi(px, lookback)
-    # mean reversion: buy when oversold, sell/short when overbought
     if long_only:
-        sig = np.where(r < buy_lt, 1.0, 0.0)
+        # enter when oversold; hold until opposite
+        raw = np.where(r < buy_lt, 1.0, 0.0)
     else:
-        sig = np.where(r < buy_lt, 1.0, np.where(r > sell_gt, -1.0, 0.0))
-    # hold until opposite
-    sig = pd.Series(sig, index=px.index).replace(0.0, np.nan).ffill().fillna(0.0)
+        raw = np.where(r < buy_lt, 1.0, np.where(r > sell_gt, -1.0, 0.0))
+
+    sig = pd.Series(raw, index=px.index).replace(0.0, np.nan).ffill().fillna(0.0)
     return sig.rename("signal")
+
+
+def _signal_sma_rsi_composite(
+    df: pd.DataFrame,
+    fast: int = 20,
+    slow: int = 100,
+    rsi_lookback: int = 14,
+    buy_lt: float = 30,
+    sell_gt: float = 70,
+    long_only: bool = True
+) -> pd.Series:
+    """
+    Long when SMA regime is bullish (fast>slow) **and** RSI < buy_lt.
+    Exit when RSI > sell_gt or regime turns off (fast<=slow).
+    For now we keep it long-only for clarity. (We can add short rules later.)
+    """
+    px = df["Adj Close"]
+    f = sma(px, fast)
+    s = sma(px, slow)
+    regime = f > s
+
+    r = rsi(px, rsi_lookback)
+
+    entries = regime & (r < buy_lt)
+    exits   = (~regime) | (r > sell_gt)
+
+    # Stateful position via forward-fill of toggles:
+    sig = pd.Series(np.nan, index=px.index, dtype=float)
+    sig[entries] = 1.0
+    sig[exits]   = 0.0
+    sig = sig.ffill().fillna(0.0)
+
+    if not long_only:
+        # (Optional) Add a mirrored short side if you want:
+        # shorts when regime is bearish & RSI > sell_gt, exit when regime flips or RSI < buy_lt
+        pass
+
+    return sig.rename("signal")
+
+# ---------- backtest engine ----------
 
 def backtest_one(
     df: pd.DataFrame,
@@ -45,19 +99,37 @@ def backtest_one(
 
     # --- signals ---
     if strategy == "SMA Crossover":
-        sig = _signal_sma(df, fast=int(params.get("fast", 20)), slow=int(params.get("slow", 100)), long_only=long_only)
-    else:
-        sig = _signal_rsi(df, lookback=int(params.get("lookback", 14)),
-                          buy_lt=float(params.get("buy_lt", 30)),
-                          sell_gt=float(params.get("sell_gt", 70)),
-                          long_only=long_only)
+        sig = _signal_sma(
+            df,
+            fast=int(params.get("fast", 20)),
+            slow=int(params.get("slow", 100)),
+            long_only=long_only,
+        )
+    elif strategy == "RSI Mean Reversion":
+        sig = _signal_rsi(
+            df,
+            lookback=int(params.get("lookback", 14)),
+            buy_lt=float(params.get("buy_lt", 30)),
+            sell_gt=float(params.get("sell_gt", 70)),
+            long_only=long_only,
+        )
+    else:  # "SMA+RSI (Composite)"
+        sig = _signal_sma_rsi_composite(
+            df,
+            fast=int(params.get("fast", 20)),
+            slow=int(params.get("slow", 100)),
+            rsi_lookback=int(params.get("rsi_lookback", 14)),
+            buy_lt=float(params.get("buy_lt", 30)),
+            sell_gt=float(params.get("sell_gt", 70)),
+            long_only=long_only,
+        )
 
     # --- sizing ---
     lev = target_vol_leverage(ret, vol_target=vol_target, span=int(params.get("vol_span", 20)))
     pos = position(sig, lev)
 
     # --- P&L / equity ---
-    strat_ret = pos * ret              # scaled by position
+    strat_ret = pos * ret
     equity = (1.0 + strat_ret).cumprod()
 
     # metrics
@@ -95,6 +167,6 @@ def backtest_one(
 
     return out, metrics
 
-# Alias so run.py can import run_backtest
+# Backward-compatible alias
 def run_backtest(*args, **kwargs):
     return backtest_one(*args, **kwargs)
