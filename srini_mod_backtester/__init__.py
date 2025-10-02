@@ -1,9 +1,8 @@
 """
-Lightweight package init to avoid importing heavy/legacy modules at import time.
-We purposely do NOT import `signals` here.
+Package init kept light. Aliases loader for backwards compatibility.
 """
 
-from .data_loader import get_prices
+from .data_loader import load_prices_yahoo as get_prices
 from .indicators import add_sma, add_rsi, add_bbands
 from .backtest_core import equity_curve_long_only
 
