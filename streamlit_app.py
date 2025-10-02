@@ -1,3 +1,3 @@
-from srini_mod_backtester import run
+from srini_mod_backtester.run import main
 if __name__ == "__main__":
     main()
