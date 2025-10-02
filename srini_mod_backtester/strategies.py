@@ -3,14 +3,11 @@ import numpy as np
 
 __all__ = ["sma_crossover_signals", "rsi_mean_reversion"]
 
-
-def sma_crossover_signals(df: pd.DataFrame, fast: int = 20, slow: int = 50) -> pd.DataFrame:
-    df = df.copy()
-    g = df.groupby("Ticker")["Close"]
-    df[f"SMA{fast}"] = g.transform(lambda s: s.rolling(fast).mean())
-    df[f"SMA{slow}"] = g.transform(lambda s: s.rolling(slow).mean())
-    df["Signal"] = np.where(df[f"SMA{fast}"] > df[f"SMA{slow}"]], 1, 0)
-    df["Trade"] = df.groupby("Ticker")["Signal"].diff().fillna(0)  # 1=buy, -1=sell
+def sma_crossover_strategy(df, fast=10, slow=50):
+    df[f"SMA{fast}"] = df["Close"].rolling(window=fast).mean()
+    df[f"SMA{slow}"] = df["Close"].rolling(window=slow).mean()
+    df["Signal"] = np.where(df[f"SMA{fast}"] > df[f"SMA{slow}"], 1, 0)
+    df["Position"] = df["Signal"].diff()
     return df
 
 
