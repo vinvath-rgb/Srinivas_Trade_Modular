@@ -1,172 +1,198 @@
-# srini_mod_backtester/backtest_core.py
+# srini_mod_backtester/data_loader.py
 from __future__ import annotations
-from typing import Dict, Tuple, Literal
-import numpy as np
+
+import time
+from typing import Dict, List, Optional
+from datetime import datetime
+import requests
 import pandas as pd
-
-from .indicators import sma, rsi
-from .sizing import target_vol_leverage, position
-
-StrategyName = Literal["SMA Crossover", "RSI Mean Reversion", "SMA+RSI (Composite)"]
-
-# ---------- signal builders ----------
-
-def _signal_sma(
-    df: pd.DataFrame,
-    fast: int = 20,
-    slow: int = 100,
-    long_only: bool = True
-) -> pd.Series:
-    px = df["Adj Close"]
-    f = sma(px, fast)
-    s = sma(px, slow)
-    sig = np.where(f > s, 1.0, -1.0)
-    if long_only:
-        sig = np.where(f > s, 1.0, 0.0)
-    return pd.Series(sig, index=px.index, name="signal")
+import yfinance as yf
 
 
-def _signal_rsi(
-    df: pd.DataFrame,
-    lookback: int = 14,
-    buy_lt: float = 30,
-    sell_gt: float = 70,
-    long_only: bool = True
-) -> pd.Series:
-    px = df["Adj Close"]
-    r = rsi(px, lookback)
-    if long_only:
-        # enter when oversold; hold until opposite
-        raw = np.where(r < buy_lt, 1.0, 0.0)
+# ---------- helpers -----------------------------------------------------------
+
+def _yf_session() -> requests.Session:
+    """
+    Build a plain requests.Session with a desktop User-Agent.
+    Newer yfinance versions no longer expose utils.get_yf_ratelimit_session().
+    """
+    s = requests.Session()
+    s.headers.update({"User-Agent": "Mozilla/5.0"})
+    return s
+
+
+def _normalize_prices(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    """
+    Accepts either a single-level OHLCV frame or a yfinance multi-index frame.
+    Returns: columns = [Open, High, Low, Close, Adj Close, Volume] for one ticker.
+    """
+    if isinstance(df.columns, pd.MultiIndex):
+        # yfinance multi-index: (field, ticker) or (ticker, field)
+        if ticker in df.columns.levels[1]:
+            out = df.xs(ticker, axis=1, level=1).copy()       # (field, ticker)
+        elif ticker in df.columns.levels[0]:
+            out = df[ticker].copy()                            # (ticker, field)
+        else:
+            raise KeyError(f"Ticker {ticker} not in downloaded frame.")
     else:
-        raw = np.where(r < buy_lt, 1.0, np.where(r > sell_gt, -1.0, 0.0))
+        out = df.copy()
 
-    sig = pd.Series(raw, index=px.index).replace(0.0, np.nan).ffill().fillna(0.0)
-    return sig.rename("signal")
+    # Standardize column names/casing
+    rename_map = {c: c.title() for c in out.columns}
+    out = out.rename(columns=rename_map)
+
+    # Ensure all required columns exist
+    for col in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
+        if col not in out.columns:
+            if col == "Adj Close" and "Close" in out.columns:
+                out[col] = out["Close"]
+            else:
+                out[col] = pd.NA
+
+    # Order columns
+    out = out[["Open", "High", "Low", "Close", "Adj Close", "Volume"]]
+    return out
 
 
-def _signal_sma_rsi_composite(
-    df: pd.DataFrame,
-    fast: int = 20,
-    slow: int = 100,
-    rsi_lookback: int = 14,
-    buy_lt: float = 30,
-    sell_gt: float = 70,
-    long_only: bool = True
-) -> pd.Series:
+def _to_datestr(x: str | datetime) -> str:
+    if isinstance(x, datetime):
+        return x.strftime("%Y-%m-%d")
+    return str(x)
+
+
+# ---------- Yahoo (primary) ---------------------------------------------------
+
+def _fetch_yahoo(
+    ticker: str,
+    start: str | datetime,
+    end: str | datetime,
+    tries: int = 2,
+    pause: float = 1.0,
+) -> pd.DataFrame:
     """
-    Long when SMA regime is bullish (fast>slow) **and** RSI < buy_lt.
-    Exit when RSI > sell_gt or regime turns off (fast<=slow).
-    For now we keep it long-only for clarity. (We can add short rules later.)
+    Robust single-ticker fetch from Yahoo using yfinance with a custom Session.
+    Returns a normalized OHLCV DataFrame (may be empty if nothing returned).
     """
-    px = df["Adj Close"]
-    f = sma(px, fast)
-    s = sma(px, slow)
-    regime = f > s
+    s = _yf_session()
+    start_s = _to_datestr(start)
+    end_s = _to_datestr(end)
 
-    r = rsi(px, rsi_lookback)
+    last_exc: Optional[Exception] = None
+    for _ in range(max(1, tries)):
+        try:
+            df = yf.download(
+                tickers=ticker,
+                start=start_s,
+                end=end_s,
+                interval="1d",
+                auto_adjust=False,
+                progress=False,
+                group_by="ticker",
+                threads=False,           # safer on some hosts
+                session=s,
+            )
+            if df is None or len(df) == 0:
+                # sometimes Yahoo responds but with no rows
+                last_exc = None
+            else:
+                df = _normalize_prices(df, ticker)
+                # Clean index
+                df.index = pd.to_datetime(df.index)
+                df = df.sort_index()
+                return df
+        except Exception as e:
+            last_exc = e
+        time.sleep(pause)
 
-    entries = regime & (r < buy_lt)
-    exits   = (~regime) | (r > sell_gt)
+    # If we get here, either empty or error every time
+    if last_exc:
+        print(f"[Yahoo] {ticker} failed: {last_exc}")
+    return pd.DataFrame()
 
-    # Stateful position via forward-fill of toggles:
-    sig = pd.Series(np.nan, index=px.index, dtype=float)
-    sig[entries] = 1.0
-    sig[exits]   = 0.0
-    sig = sig.ffill().fillna(0.0)
 
-    if not long_only:
-        # (Optional) Add a mirrored short side if you want:
-        # shorts when regime is bearish & RSI > sell_gt, exit when regime flips or RSI < buy_lt
-        pass
+# ---------- Stooq (fallback) --------------------------------------------------
 
-    return sig.rename("signal")
-
-# ---------- backtest engine ----------
-
-def backtest_one(
-    df: pd.DataFrame,
-    strategy: StrategyName,
-    params: Dict,
-    vol_target: float = 0.15,
-    long_only: bool = True,
-) -> Tuple[pd.DataFrame, Dict]:
+def _stooq_symbol(ticker: str) -> str:
     """
-    Returns per-ticker result frame (with equity) and metrics dict.
+    Build a Stooq symbol. For most US tickers: lower-case + '.us' (e.g., spy.us).
+    This is a heuristic; Stooq coverage is limited for non-US markets.
     """
-    px = df["Adj Close"].dropna()
-    ret = px.pct_change().fillna(0.0)
+    t = ticker.strip().lower()
+    if "." in t:   # e.g., 'brk.b' or exchange suffixes — leave as is and try
+        return t
+    return f"{t}.us"
 
-    # --- signals ---
-    if strategy == "SMA Crossover":
-        sig = _signal_sma(
-            df,
-            fast=int(params.get("fast", 20)),
-            slow=int(params.get("slow", 100)),
-            long_only=long_only,
-        )
-    elif strategy == "RSI Mean Reversion":
-        sig = _signal_rsi(
-            df,
-            lookback=int(params.get("lookback", 14)),
-            buy_lt=float(params.get("buy_lt", 30)),
-            sell_gt=float(params.get("sell_gt", 70)),
-            long_only=long_only,
-        )
-    else:  # "SMA+RSI (Composite)"
-        sig = _signal_sma_rsi_composite(
-            df,
-            fast=int(params.get("fast", 20)),
-            slow=int(params.get("slow", 100)),
-            rsi_lookback=int(params.get("rsi_lookback", 14)),
-            buy_lt=float(params.get("buy_lt", 30)),
-            sell_gt=float(params.get("sell_gt", 70)),
-            long_only=long_only,
-        )
 
-    # --- sizing ---
-    lev = target_vol_leverage(ret, vol_target=vol_target, span=int(params.get("vol_span", 20)))
-    pos = position(sig, lev)
+def _fetch_stooq(
+    ticker: str,
+    start: str | datetime,
+    end: str | datetime,
+) -> pd.DataFrame:
+    """
+    Simple Stooq fetch via CSV. Returns normalized OHLCV (Adj Close = Close).
+    """
+    sym = _stooq_symbol(ticker)
+    url = f"https://stooq.com/q/d/l/?s={sym}&i=d"
+    try:
+        df = pd.read_csv(url)
+        if df.empty:
+            return pd.DataFrame()
 
-    # --- P&L / equity ---
-    strat_ret = pos * ret
-    equity = (1.0 + strat_ret).cumprod()
+        df["Date"] = pd.to_datetime(df["Date"])
+        df = df.set_index("Date").sort_index()
+        # rename to standard
+        df = df.rename(columns={
+            "Open": "Open",
+            "High": "High",
+            "Low": "Low",
+            "Close": "Close",
+            "Volume": "Volume",
+        })
+        # fill Adj Close = Close
+        df["Adj Close"] = df["Close"]
+        df = df[["Open", "High", "Low", "Close", "Adj Close", "Volume"]]
 
-    # metrics
-    def ann(ret_s: pd.Series) -> float:
-        return float((1 + ret_s).prod() ** (252/len(ret_s)) - 1) if len(ret_s) > 0 else 0.0
+        # date slice to requested range
+        df = df.loc[_to_datestr(start):_to_datestr(end)]
+        return df
+    except Exception as e:
+        print(f"[Stooq] {ticker} failed: {e}")
+        return pd.DataFrame()
 
-    def sharpe(ret_s: pd.Series) -> float:
-        mu = ret_s.mean() * 252
-        sd = ret_s.std() * np.sqrt(252) + 1e-12
-        return float(mu / sd)
 
-    roll_max = equity.cummax()
-    dd = equity / roll_max - 1.0
-    maxdd = float(dd.min())
+# ---------- Public API --------------------------------------------------------
 
-    exposure = float((pos != 0).sum() / max(1, len(pos)))
+def load_adj_close(
+    tickers: List[str],
+    start: str | datetime,
+    end: str | datetime,
+    prefer: str = "yahoo",  # "yahoo" -> Stooq fallback
+) -> Dict[str, pd.DataFrame]:
+    """
+    Fetch daily OHLCV for each ticker between start and end (inclusive range),
+    normalized to columns: [Open, High, Low, Close, Adj Close, Volume].
 
-    metrics = {
-        "CAGR": ann(strat_ret),
-        "Sharpe": sharpe(strat_ret),
-        "MaxDD": maxdd,
-        "Exposure": exposure,
-        "LastEquity": float(equity.iloc[-1]) if len(equity) else 1.0,
-    }
+    Returns: dict[ticker] -> DataFrame (may be empty if all sources failed).
+    """
+    out: Dict[str, pd.DataFrame] = {}
 
-    out = pd.DataFrame({
-        "Price": px,
-        "Returns": ret,
-        "Signal": sig,
-        "Leverage": lev,
-        "Position": pos,
-        "StratRet": strat_ret,
-        "Equity": equity,
-    })
+    for t in tickers:
+        t = t.strip()
+        df = pd.DataFrame()
 
-    return out, metrics
+        if prefer.lower() == "yahoo":
+            df = _fetch_yahoo(t, start, end)
+            if df.empty:
+                # fallback to Stooq (best effort for US symbols)
+                df = _fetch_stooq(t, start, end)
+        else:
+            # Stooq first, then Yahoo
+            df = _fetch_stooq(t, start, end)
+            if df.empty:
+                df = _fetch_yahoo(t, start, end)
 
-# Backward-compatible alias
-def run_backtest(*args, **kwargs):
-    return backtest_one(*args, **kwargs)
+        if df.empty:
+            print(f"[DataLoader] No data for {t} from Yahoo or Stooq.")
+        out[t] = df
+
+    return out
