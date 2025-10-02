@@ -3,7 +3,7 @@ import numpy as np
 
 __all__ = ["sma_crossover_signals", "rsi_mean_reversion"]
 
-def sma_crossover_strategy(df, fast=10, slow=50):
+def sma_crossover_signals(df, fast=10, slow=50):
     df[f"SMA{fast}"] = df["Close"].rolling(window=fast).mean()
     df[f"SMA{slow}"] = df["Close"].rolling(window=slow).mean()
     df["Signal"] = np.where(df[f"SMA{fast}"] > df[f"SMA{slow}"], 1, 0)
