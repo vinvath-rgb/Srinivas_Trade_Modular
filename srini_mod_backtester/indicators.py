@@ -1,86 +1,39 @@
-# srini_mod_backtester/indicators.py
-from __future__ import annotations
 import pandas as pd
+import numpy as np
 
-__all__ = ["atr", "sma", "rsi"]
 
-def atr(
-    high: pd.Series,
-    low: pd.Series,
-    close: pd.Series,
-    period: int = 14,
-    fillna: bool = False,
-) -> pd.Series:
-    """
-    Wilder's Average True Range.
-    Returns a Series named 'ATR_{period}'.
-    """
-    high = pd.to_numeric(high, errors="coerce")
-    low = pd.to_numeric(low, errors="coerce")
-    close = pd.to_numeric(close, errors="coerce")
+def add_sma(df: pd.DataFrame, window: int = 50) -> pd.DataFrame:
+    df = df.copy()
+    df[f"SMA{window}"] = (
+        df.groupby("Ticker")["Close"].transform(lambda s: s.rolling(window).mean())
+    )
+    return df
 
-    prev_close = close.shift(1)
-    tr1 = high - low
-    tr2 = (high - prev_close).abs()
-    tr3 = (low - prev_close).abs()
-    true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
-    out = true_range.ewm(alpha=1 / period, adjust=False).mean()
-    if fillna:
-        out = out.fillna(0.0)
-    return out.rename(f"ATR_{period}")
+def add_rsi(df: pd.DataFrame, window: int = 14) -> pd.DataFrame:
+    df = df.copy()
 
-def sma(
-    series: pd.Series,
-    period: int = 20,
-    min_periods: int | None = None,
-    fillna: bool = False,
-) -> pd.Series:
-    """
-    Simple Moving Average.
-    Returns a Series named 'SMA_{period}'.
-    """
-    s = pd.to_numeric(series, errors="coerce")
-    if min_periods is None:
-        min_periods = period
-    out = s.rolling(window=period, min_periods=min_periods).mean()
-    if fillna:
-        out = out.fillna(method="backfill")
-    return out.rename(f"SMA_{period}")
+    def _rsi(close: pd.Series, n: int) -> pd.Series:
+        delta = close.diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        # Wilder's smoothing via EWM alpha=1/n
+        avg_gain = gain.ewm(alpha=1 / n, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1 / n, adjust=False).mean()
+        rs = avg_gain / avg_loss.replace(0, np.nan)
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
 
-def rsi(
-    close: pd.Series,
-    period: int = 14,
-    method: str = "wilder",  # "wilder" (EMA with alpha=1/period) or "sma"
-    fillna: bool = False,
-) -> pd.Series:
-    """
-    Relative Strength Index (RSI).
-    Returns a Series named 'RSI_{period}'.
-    """
-    c = pd.to_numeric(close, errors="coerce")
-    delta = c.diff()
+    df["RSI14"] = df.groupby("Ticker")["Close"].transform(lambda s: _rsi(s, window))
+    return df
 
-    gain = delta.clip(lower=0)
-    loss = (-delta).clip(lower=0)
 
-    if method.lower() == "sma":
-        avg_gain = gain.rolling(period, min_periods=period).mean()
-        avg_loss = loss.rolling(period, min_periods=period).mean()
-    else:
-        # Wilder's smoothing
-        avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
-        avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
-
-    rs = avg_gain / avg_loss.replace(0, pd.NA)
-    rsi_series = 100 - (100 / (1 + rs))
-
-    # When avg_loss is 0, RSI should be 100; when avg_gain is 0, RSI should be 0
-    rsi_series = rsi_series.fillna(
-        value=100.0
-    ).where(avg_gain.notna() | avg_loss.notna(), other=pd.NA)
-
-    if fillna:
-        rsi_series = rsi_series.fillna(method="backfill")
-
-    return rsi_series.rename(f"RSI_{period}")
+def add_bbands(df: pd.DataFrame, window: int = 20, num_std: float = 2.0) -> pd.DataFrame:
+    df = df.copy()
+    g = df.groupby("Ticker")["Close"]
+    ma = g.transform(lambda s: s.rolling(window).mean())
+    sd = g.transform(lambda s: s.rolling(window).std())
+    df["BB_Mid"] = ma
+    df["BB_Up"] = ma + num_std * sd
+    df["BB_Lo"] = ma - num_std * sd
+    return df
