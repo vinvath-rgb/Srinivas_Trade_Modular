@@ -95,3 +95,38 @@ def load_prices(
                 pass
 
     return got
+    
+    # --- convenience wrapper: returns a single Adj Close DataFrame -----------
+
+def load_adj_close(tickers, start, end, threads=False, timeout=60):
+    """
+    Convenience wrapper over load_prices(...).
+    Returns a DataFrame with Adj Close columns for the requested tickers.
+    Index = trading dates; columns = tickers (only those successfully fetched).
+    """
+    if isinstance(tickers, str):
+        tickers = [t.strip() for t in tickers.split(",") if t.strip()]
+    price_map = load_prices(
+        tickers=tickers,
+        start=start,
+        end=end,
+        threads=threads,
+        timeout=timeout,
+    )
+    frames = []
+    cols = []
+    for t in tickers:
+        df = price_map.get(t)
+        if df is None or df.empty:
+            continue
+        s = df["Adj Close"].astype(float).rename(t)
+        frames.append(s)
+        cols.append(t)
+    if not frames:
+        # empty result
+        return pd.DataFrame(index=pd.Index([], name="Date"), columns=tickers, dtype=float)
+    out = pd.concat(frames, axis=1)
+    # ensure the columns order follows the input tickers where available
+    present = [c for c in tickers if c in out.columns]
+    out = out[present]
+    return out
