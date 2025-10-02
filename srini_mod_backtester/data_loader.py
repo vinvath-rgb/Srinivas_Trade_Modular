@@ -1,9 +1,15 @@
-# srini_mod_backtester/data_loader.py
+#srini_mod_backtester/data_loader.py
 from __future__ import annotations
+
+import os
 import time
+import datetime as dt
 from typing import Dict, List
+
+import requests
 import pandas as pd
 import yfinance as yf
+
 
 # ---- Robust Yahoo → Stooq fetch ---------------------------------------------
 
