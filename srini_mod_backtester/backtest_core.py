@@ -1,146 +1,100 @@
 # srini_mod_backtester/backtest_core.py
 from __future__ import annotations
-from typing import Dict, Literal, Tuple
+from typing import Dict, Tuple, Literal
 import numpy as np
 import pandas as pd
 
-from .indicators import sma, rsi, atr
-from .sizing import target_vol_leverage
-from .utils import annualize_return, sharpe_ratio
+from .indicators import sma, rsi
+from .sizing import target_vol_leverage, position
 
 StrategyName = Literal["SMA Crossover", "RSI Mean Reversion"]
 
-def _signals_sma(df: pd.DataFrame, fast:int=20, slow:int=100) -> pd.Series:
-    f = sma(df["Adj Close"], fast)
-    s = sma(df["Adj Close"], slow)
-    sig = np.where(f > s, 1.0, 0.0)  # long-only version
-    return pd.Series(sig, index=df.index, name="signal")
+def _signal_sma(df: pd.DataFrame, fast: int = 20, slow: int = 100, long_only: bool = True) -> pd.Series:
+    px = df["Adj Close"]
+    f = sma(px, fast)
+    s = sma(px, slow)
+    sig = np.where(f > s, 1.0, -1.0)
+    if long_only:
+        sig = np.where(f > s, 1.0, 0.0)
+    return pd.Series(sig, index=px.index, name="signal")
 
-def _signals_rsi(df: pd.DataFrame, lookback:int=14, buy:int=30, sell:int=70) -> pd.Series:
-    r = rsi(df["Adj Close"], lookback)
-    sig = np.where(r < buy, 1.0, np.where(r > sell, 0.0, np.nan))
-    # carry forward last decision (hold until opposite)
-    sig = pd.Series(sig, index=df.index).ffill().fillna(0.0)
-    sig.name = "signal"
-    return sig
+def _signal_rsi(df: pd.DataFrame, lookback: int = 14, buy_lt: float = 30, sell_gt: float = 70, long_only: bool = True) -> pd.Series:
+    px = df["Adj Close"]
+    r = rsi(px, lookback)
+    # mean reversion: buy when oversold, sell/short when overbought
+    if long_only:
+        sig = np.where(r < buy_lt, 1.0, 0.0)
+    else:
+        sig = np.where(r < buy_lt, 1.0, np.where(r > sell_gt, -1.0, 0.0))
+    # hold until opposite
+    sig = pd.Series(sig, index=px.index).replace(0.0, np.nan).ffill().fillna(0.0)
+    return sig.rename("signal")
 
 def backtest_one(
     df: pd.DataFrame,
-    strategy: StrategyName = "SMA Crossover",
-    params: dict | None = None,
-    vol_target: float = 0.15,        # annualized
-    atr_stop_x: float | None = None, # e.g. 3.0 => stop = entry - 3*ATR
-) -> Tuple[pd.DataFrame, dict]:
+    strategy: StrategyName,
+    params: Dict,
+    vol_target: float = 0.15,
+    long_only: bool = True,
+) -> Tuple[pd.DataFrame, Dict]:
     """
-    Runs a single-ticker backtest.
-    Returns (daily_frame, summary_stats)
-    daily_frame columns: ['ret','signal','lev','pnl','equity','exposure', ...]
+    Returns per-ticker result frame (with equity) and metrics dict.
     """
-    params = params or {}
-    px = df["Adj Close"].astype(float)
+    px = df["Adj Close"].dropna()
     ret = px.pct_change().fillna(0.0)
 
-    # --- signals
+    # --- signals ---
     if strategy == "SMA Crossover":
-        fast = int(params.get("fast", 20))
-        slow = int(params.get("slow", 100))
-        sig = _signals_sma(df, fast=fast, slow=slow)
-    elif strategy == "RSI Mean Reversion":
-        look = int(params.get("lookback",14))
-        buy = int(params.get("buy",30))
-        sell = int(params.get("sell",70))
-        sig = _signals_rsi(df, lookback=look, buy=buy, sell=sell)
+        sig = _signal_sma(df, fast=int(params.get("fast", 20)), slow=int(params.get("slow", 100)), long_only=long_only)
     else:
-        raise ValueError(f"Unknown strategy: {strategy}")
+        sig = _signal_rsi(df, lookback=int(params.get("lookback", 14)),
+                          buy_lt=float(params.get("buy_lt", 30)),
+                          sell_gt=float(params.get("sell_gt", 70)),
+                          long_only=long_only)
 
-    # --- sizing: simple daily realized vol -> leverage
-    # realized vol (rolling) on returns
-    realized_vol = ret.rolling(20).std() * np.sqrt(252)
-    lev = target_vol_leverage(realized_vol, vol_target)  # user function in sizing.py
-    lev = lev.fillna(0.0)
+    # --- sizing ---
+    lev = target_vol_leverage(ret, vol_target=vol_target, span=int(params.get("vol_span", 20)))
+    pos = position(sig, lev)
 
-    # position before stop logic
-    pos_raw = sig * lev
+    # --- P&L / equity ---
+    strat_ret = pos * ret              # scaled by position
+    equity = (1.0 + strat_ret).cumprod()
 
-    # --- optional ATR stop (long-only; simple example)
-    if atr_stop_x:
-        true_range = atr(df["High"], df["Low"], df["Close"], window=14)
-        stop = pd.Series(np.nan, index=px.index)
-        in_trade = False
-        entry = np.nan
-        for i in range(1, len(px)):
-            if not in_trade and pos_raw.iloc[i-1] > 0 and pos_raw.iloc[i] > 0:
-                # enter
-                in_trade = True
-                entry = px.iloc[i]
-                stop.iloc[i] = entry - atr_stop_x * true_range.iloc[i]
-            elif in_trade:
-                # trail stop up if price rises
-                new_stop = px.iloc[i] - atr_stop_x * true_range.iloc[i]
-                stop.iloc[i] = max(stop.iloc[i-1], new_stop) if not np.isnan(stop.iloc[i-1]) else new_stop
-                # exit if broken
-                if px.iloc[i] <= stop.iloc[i]:
-                    in_trade = False
-                    entry = np.nan
-            else:
-                stop.iloc[i] = stop.iloc[i-1] if i>0 else np.nan
-        # zero out position when stop is active and price below stop
-        stopped = (px <= stop) & stop.notna()
-        pos = pos_raw.where(~stopped, 0.0)
-    else:
-        pos = pos_raw
+    # metrics
+    def ann(ret_s: pd.Series) -> float:
+        return float((1 + ret_s).prod() ** (252/len(ret_s)) - 1) if len(ret_s) > 0 else 0.0
 
-    # --- PnL (simple)
-    pnl = (pos.shift(1).fillna(0.0)) * ret  # yesterday’s position * today’s return
-    equity = (1.0 + pnl).cumprod()
-    exposure = (pos.abs() > 1e-9).astype(float)
+    def sharpe(ret_s: pd.Series) -> float:
+        mu = ret_s.mean() * 252
+        sd = ret_s.std() * np.sqrt(252) + 1e-12
+        return float(mu / sd)
 
-    # --- stats
-    cagr = annualize_return(equity.pct_change().fillna(0.0))
-    shrp = sharpe_ratio(pnl)
-    maxdd = (equity / equity.cummax() - 1.0).min()
-    exp = exposure.mean()
+    roll_max = equity.cummax()
+    dd = equity / roll_max - 1.0
+    maxdd = float(dd.min())
 
-    daily = pd.DataFrame({
-        "ret": ret,
-        "signal": sig,
-        "lev": pos,
-        "pnl": pnl,
-        "equity": equity,
-        "exposure": exposure,
-        "realized_vol": realized_vol,
+    exposure = float((pos != 0).sum() / max(1, len(pos)))
+
+    metrics = {
+        "CAGR": ann(strat_ret),
+        "Sharpe": sharpe(strat_ret),
+        "MaxDD": maxdd,
+        "Exposure": exposure,
+        "LastEquity": float(equity.iloc[-1]) if len(equity) else 1.0,
+    }
+
+    out = pd.DataFrame({
+        "Price": px,
+        "Returns": ret,
+        "Signal": sig,
+        "Leverage": lev,
+        "Position": pos,
+        "StratRet": strat_ret,
+        "Equity": equity,
     })
 
-    stats = {
-        "CAGR": float(cagr),
-        "Sharpe": float(shrp),
-        "MaxDD": float(maxdd),
-        "Exposure": float(exp),
-        "LastEquity": float(equity.iloc[-1]),
-    }
-    return daily, stats
+    return out, metrics
 
-def backtest_multi(
-    price_map: Dict[str, pd.DataFrame],
-    strategy: StrategyName = "SMA Crossover",
-    params: dict | None = None,
-    vol_target: float = 0.15,
-    atr_stop_x: float | None = None,
-) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame]:
-    """
-    Runs backtest for multiple tickers.
-    Returns: (per_ticker_daily_frames, summary_df)
-    """
-    per: Dict[str, pd.DataFrame] = {}
-    rows = []
-    for t, df in price_map.items():
-        if df is None or df.empty:
-            continue
-        daily, s = backtest_one(
-            df, strategy=strategy, params=params,
-            vol_target=vol_target, atr_stop_x=atr_stop_x
-        )
-        per[t] = daily
-        rows.append({"Ticker": t, **s})
-    summary = pd.DataFrame(rows).set_index("Ticker")
-    return per, summary
+# Alias so run.py can import run_backtest
+def run_backtest(*args, **kwargs):
+    return backtest_one(*args, **kwargs)
