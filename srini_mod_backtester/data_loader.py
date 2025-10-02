@@ -1,132 +1,41 @@
 # srini_mod_backtester/data_loader.py
 from __future__ import annotations
-import datetime as dt
-from typing import Dict, List
 import pandas as pd
 import yfinance as yf
+from typing import List, Dict
 
-# --- helpers ---------------------------------------------------------------
-
-def _normalize_prices(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+def load_adj_close(tickers: List[str], start: str, end: str) -> Dict[str, pd.DataFrame]:
     """
-    Accepts either a single-level OHLCV frame or a yfinance multi-index frame.
-    Returns: columns = [Open, High, Low, Close, Adj Close, Volume] for one ticker.
+    Returns dict[ticker] -> DataFrame with columns: ['Adj Close']
+    Index is DatetimeIndex (business days).
     """
-    if isinstance(df.columns, pd.MultiIndex):
-        # yfinance multi-index: (field, ticker) or (ticker, field)
-        if ticker in df.columns.levels[0]:
-            # (ticker, field)
-            out = df[ticker].copy()
-        elif ticker in df.columns.levels[1]:
-            # (field, ticker)
-            out = df.xs(ticker, axis=1, level=1).copy()
-        else:
-            raise KeyError(f"Ticker {ticker} not in downloaded frame.")
-    else:
-        out = df.copy()
+    out: Dict[str, pd.DataFrame] = {}
+    if not tickers:
+        return out
 
-    # Standardize column casing
-    rename_map = {c: c.title() for c in out.columns}
-    out = out.rename(columns=rename_map)
-    for col in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
-        if col not in out.columns:
-            # Some feeds miss 'Adj Close'—fallback to Close
-            if col == "Adj Close" and "Close" in out.columns:
-                out[col] = out["Close"]
-            else:
-                out[col] = pd.NA
-    return out[["Open", "High", "Low", "Close", "Adj Close", "Volume"]]
-
-# --- public API ------------------------------------------------------------
-
-def load_prices(
-    tickers: List[str],
-    start: str | dt.date,
-    end: str | dt.date,
-    source: str = "yahoo",
-    threads: bool = False,
-    timeout: int = 60,
-) -> Dict[str, pd.DataFrame]:
-    """
-    Download daily OHLCV for each ticker. Currently uses yfinance for all.
-    Returns dict: {ticker: DataFrame[Date-indexed OHLCV]}.
-    """
-    if isinstance(start, str): start = dt.date.fromisoformat(start.replace("/", "-"))
-    if isinstance(end, str):   end = dt.date.fromisoformat(end.replace("/", "-"))
-
-    end_inclusive = end + dt.timedelta(days=1)  # yfinance end is exclusive
-    got: Dict[str, pd.DataFrame] = {}
-
-    # Use a single batched download for efficiency where possible.
-    dl = yf.download(
+    data = yf.download(
         tickers=tickers,
         start=start,
-        end=end_inclusive,
+        end=end,
         interval="1d",
         auto_adjust=False,
         progress=False,
         group_by="ticker",
-        threads=threads,
-        timeout=timeout,
+        threads=False,
+        timeout=60,
     )
 
-    for t in tickers:
-        try:
-            one = _normalize_prices(dl, t)
-            one.index = pd.to_datetime(one.index)
-            one = one.sort_index()
-            # Drop rows with all-NA Close (avoid empty frames)
-            one = one[one["Close"].notna()]
-            got[t] = one
-        except Exception:
-            # Fallback: single-ticker call (sometimes more reliable)
-            try:
-                single = yf.download(
-                    t, start=start, end=end_inclusive, interval="1d",
-                    auto_adjust=False, progress=False, threads=False, timeout=timeout
-                )
-                single = _normalize_prices(single, t)
-                single.index = pd.to_datetime(single.index)
-                single = single.sort_index()
-                single = single[single["Close"].notna()]
-                if not single.empty:
-                    got[t] = single
-            except Exception:
-                pass
+    # yfinance multi-index if multiple tickers; single index if one ticker
+    if isinstance(data.columns, pd.MultiIndex):
+        for t in tickers:
+            if t in data.columns.get_level_values(0):
+                df = data[t][["Adj Close"]].dropna().copy()
+                df.columns = ["Adj Close"]
+                out[t] = df
+    else:
+        # single ticker case
+        df = data[["Adj Close"]].dropna().copy()
+        df.columns = ["Adj Close"]
+        out[tickers[0]] = df
 
-    return got
-    
-    # --- convenience wrapper: returns a single Adj Close DataFrame -----------
-
-def load_adj_close(tickers, start, end, threads=False, timeout=60):
-    """
-    Convenience wrapper over load_prices(...).
-    Returns a DataFrame with Adj Close columns for the requested tickers.
-    Index = trading dates; columns = tickers (only those successfully fetched).
-    """
-    if isinstance(tickers, str):
-        tickers = [t.strip() for t in tickers.split(",") if t.strip()]
-    price_map = load_prices(
-        tickers=tickers,
-        start=start,
-        end=end,
-        threads=threads,
-        timeout=timeout,
-    )
-    frames = []
-    cols = []
-    for t in tickers:
-        df = price_map.get(t)
-        if df is None or df.empty:
-            continue
-        s = df["Adj Close"].astype(float).rename(t)
-        frames.append(s)
-        cols.append(t)
-    if not frames:
-        # empty result
-        return pd.DataFrame(index=pd.Index([], name="Date"), columns=tickers, dtype=float)
-    out = pd.concat(frames, axis=1)
-    # ensure the columns order follows the input tickers where available
-    present = [c for c in tickers if c in out.columns]
-    out = out[present]
     return out
