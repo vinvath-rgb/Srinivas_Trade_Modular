@@ -3,84 +3,154 @@ from __future__ import annotations
 
 import time
 from typing import Dict, List, Tuple
+from datetime import datetime, timedelta
+
 import pandas as pd
 import requests
 import yfinance as yf
 
-# ---------- helpers -----------------------------------------------------------
+
+# ------------------------------ helpers --------------------------------------
+
+def _inclusive_end(end_str: str) -> str:
+    """yfinance 'end' is exclusive; bump by +1 day."""
+    try:
+        d = datetime.strptime(end_str, "%Y-%m-%d")
+    except ValueError:
+        d = pd.to_datetime(end_str).to_pydatetime()
+    return (d + timedelta(days=1)).strftime("%Y-%m-%d")
+
 
 def _yf_session() -> requests.Session:
     s = requests.Session()
     s.headers.update({"User-Agent": "Mozilla/5.0 (compatible; SriniBacktester/1.0)"})
     return s
 
-def _normalize(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
-    """Return Yahoo-like OHLCV single-index columns."""
+
+def _normalize_ohlcv(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    """Ensure single-index OHLCV; create Adj Close if missing."""
     if isinstance(df.columns, pd.MultiIndex):
-        # either (field, ticker) or (ticker, field)
+        # (field, ticker) or (ticker, field) — collapse to fields
         if ticker in df.columns.get_level_values(-1):
             df = df.xs(ticker, axis=1, level=-1)
         elif ticker in df.columns.get_level_values(0):
             df = df.xs(ticker, axis=1, level=0)
 
-    # make sure expected cols exist
-    want = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
     if "Adj Close" not in df.columns and "Close" in df.columns:
         df["Adj Close"] = df["Close"]
-    cols = [c for c in want if c in df.columns]
+
+    cols = [c for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"] if c in df.columns]
     return df[cols].copy()
 
-# ---------- sources -----------------------------------------------------------
+
+# ------------------------------ Yahoo ----------------------------------------
 
 def _fetch_yahoo(ticker: str, start: str, end: str, tries: int = 3) -> Tuple[pd.DataFrame, str]:
     sess = _yf_session()
+    end_inc = _inclusive_end(end)
     last_err = ""
-    for i in range(tries):
+    for i in range(1, tries + 1):
         try:
             df = yf.download(
                 tickers=ticker,
                 start=start,
-                end=end,
+                end=end_inc,
                 interval="1d",
                 auto_adjust=False,
                 progress=False,
                 group_by="column",
                 threads=False,
-                timeout=30,
                 session=sess,
+                timeout=30,
             )
             if isinstance(df, pd.DataFrame) and not df.empty:
-                return _normalize(df, ticker), ""
-            last_err = "empty dataframe"
+                return _normalize_ohlcv(df, ticker), "Yahoo"
+            last_err = "Yahoo returned empty dataframe"
         except Exception as e:
-            last_err = f"{type(e).__name__}: {e}"
-        time.sleep(1.0 + i)
-    return pd.DataFrame(), f"Yahoo fail {ticker}: {last_err}"
+            last_err = f"Yahoo error: {type(e).__name__}: {e}"
+        time.sleep(0.8 * i)
+    return pd.DataFrame(), last_err
 
-def _fetch_stooq(ticker: str, start: str, end: str) -> Tuple[pd.DataFrame, str]:
+
+# ------------------------------ Stooq via pandas_datareader -------------------
+
+def _fetch_stooq_pdr(ticker: str, start: str, end: str) -> Tuple[pd.DataFrame, str]:
+    """Stooq using pandas_datareader (no yfinance override)."""
     try:
         import pandas_datareader.data as pdr
-        yf.pdr_override()
+    except Exception as e:
+        return pd.DataFrame(), f"Stooq PDR import error: {type(e).__name__}: {e}"
+
+    try:
         df = pdr.get_data_stooq(ticker)
         if df is None or df.empty:
-            return pd.DataFrame(), "Stooq empty"
+            return pd.DataFrame(), "Stooq PDR returned empty dataframe"
+
+        # Stooq returns descending dates
         df = df.sort_index()
-        df = df.loc[(df.index >= pd.to_datetime(start)) & (df.index <= pd.to_datetime(end))]
+
+        # Slice by date (inclusive)
+        s = pd.to_datetime(start)
+        e = pd.to_datetime(end)
+        df = df.loc[(df.index >= s) & (df.index <= e)]
+
         if "Adj Close" not in df.columns and "Close" in df.columns:
             df["Adj Close"] = df["Close"]
+
         keep = [c for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"] if c in df.columns]
-        return df[keep].copy(), ""
+        return df[keep].copy(), "Stooq(PDR)"
     except Exception as e:
-        return pd.DataFrame(), f"Stooq error: {type(e).__name__}: {e}"
+        return pd.DataFrame(), f"Stooq PDR error: {type(e).__name__}: {e}"
 
-# ---------- public API --------------------------------------------------------
 
-def load_adj_close(tickers: List[str], start: str, end: str) -> Tuple[Dict[str, pd.DataFrame], List[str], Dict[str, str]]:
+# ------------------------------ Stooq raw CSV (final fallback) ---------------
+
+def _stooq_symbol_csv(ticker: str) -> str:
     """
-    Returns (data, failed, notes)
+    CSV endpoint expects symbols like 'spy.us' for US listings.
+    Heuristic: if there's already a dot (e.g., BRK.B), leave as-is; else add '.us'.
+    """
+    t = ticker.strip().lower()
+    if "." in t:
+        return t
+    return f"{t}.us"
+
+def _fetch_stooq_csv(ticker: str, start: str, end: str) -> Tuple[pd.DataFrame, str]:
+    sym = _stooq_symbol_csv(ticker)
+    url = f"https://stooq.com/q/d/l/?s={sym}&i=d"
+    try:
+        df = pd.read_csv(url)
+        if df is None or df.empty:
+            return pd.DataFrame(), "Stooq CSV returned empty dataframe"
+
+        df["Date"] = pd.to_datetime(df["Date"])
+        df = df.set_index("Date").sort_index()
+
+        # Align columns and add Adj Close if missing
+        if "Adj Close" not in df.columns and "Close" in df.columns:
+            df["Adj Close"] = df["Close"]
+
+        # Date slice (inclusive)
+        s = pd.to_datetime(start)
+        e = pd.to_datetime(end)
+        df = df.loc[(df.index >= s) & (df.index <= e)]
+
+        keep = [c for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"] if c in df.columns]
+        return df[keep].copy(), "Stooq(CSV)"
+    except Exception as e:
+        return pd.DataFrame(), f"Stooq CSV error: {type(e).__name__}: {e}"
+
+
+# ------------------------------ public API -----------------------------------
+
+def load_adj_close(
+    tickers: List[str], start: str, end: str
+) -> Tuple[Dict[str, pd.DataFrame], List[str], Dict[str, str]]:
+    """
+    Returns (data, failed, notes):
       data  : {ticker -> OHLCV DataFrame}
       failed: [tickers with no data]
-      notes : {ticker -> 'Yahoo' or 'Stooq' source or error message}
+      notes : {ticker -> 'Yahoo' | 'Stooq(PDR)' | 'Stooq(CSV)' | error string}
     """
     out: Dict[str, pd.DataFrame] = {}
     failed: List[str] = []
@@ -91,19 +161,29 @@ def load_adj_close(tickers: List[str], start: str, end: str) -> Tuple[Dict[str, 
         if not t:
             continue
 
-        df, err = _fetch_yahoo(t, start, end)
+        # 1) Try Yahoo
+        df, note = _fetch_yahoo(t, start, end)
         if not df.empty:
             out[t] = df
-            notes[t] = "Yahoo"
+            notes[t] = note
             continue
 
-        df, err2 = _fetch_stooq(t, start, end)
+        # 2) Try Stooq via pandas_datareader
+        df, note = _fetch_stooq_pdr(t, start, end)
         if not df.empty:
             out[t] = df
-            notes[t] = "Stooq"
+            notes[t] = note
             continue
 
+        # 3) Try raw CSV endpoint
+        df, note = _fetch_stooq_csv(t, start, end)
+        if not df.empty:
+            out[t] = df
+            notes[t] = note
+            continue
+
+        # 4) All failed
         failed.append(t)
-        notes[t] = err2 or err or "unknown"
+        notes[t] = note
 
     return out, failed, notes
