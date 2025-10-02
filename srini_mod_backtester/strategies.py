@@ -24,3 +24,4 @@ def rsi_mean_reversion(df: pd.DataFrame, low: int = 30, high: int = 70) -> pd.Da
     df["Signal"] = df.groupby("Ticker")["Signal"].ffill().fillna(0)
     df["Trade"] = df.groupby("Ticker")["Signal"].diff().fillna(0)
     return df
+    
