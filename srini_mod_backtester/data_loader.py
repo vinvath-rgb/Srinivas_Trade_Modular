@@ -1,86 +1,65 @@
-from __future__ import annotations
-import datetime as dt
+"""
+data_loader.py
+---------------
+Single-responsibility data loader for price history.
+
+- Uses yfinance WITHOUT pdr_override (removed in new yfinance).
+- Returns a clean OHLCV DataFrame indexed by Date.
+- Caches results to avoid re-downloading during UI tweaks.
+"""
+
+from functools import lru_cache
+from typing import Optional
 import pandas as pd
 import yfinance as yf
 
 
-def _tidy_from_wide(df: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
-    """Normalize yfinance wide dataframe to tidy OHLCV with Ticker column."""
-    frames = []
-    if len(tickers) == 1:
-        sub = df.copy()
-        sub.columns = [c.title() for c in sub.columns]
-        sub["Ticker"] = tickers[0]
-        frames.append(sub.reset_index().rename(columns={"Date": "Date"}))
-    else:
-        for t in tickers:
-            sub = df[t].copy()
-            sub.columns = [c.title() for c in sub.columns]
-            sub["Ticker"] = t
-            frames.append(sub.reset_index().rename(columns={"Date": "Date"}))
-    out = pd.concat(frames, ignore_index=True)
-    cols = ["Ticker", "Date", "Open", "High", "Low", "Close", "Adj Close", "Volume"]
-    out = out[cols]
-    out = out.sort_values(["Ticker", "Date"]).reset_index(drop=True)
-    return out
-
-
-def get_prices(
-    tickers: list[str] | str,
-    start: str | dt.date | None = "2005-01-01",
-    end: str | dt.date | None = None,
-    source: str = "yahoo",  # "yahoo" | "stooq"
+@lru_cache(maxsize=256)
+def load_prices_yahoo(
+    ticker: str,
+    start: str,
+    end: Optional[str] = None,
     interval: str = "1d",
     auto_adjust: bool = True,
 ) -> pd.DataFrame:
     """
-    Returns tidy OHLCV DataFrame with columns:
-    ['Ticker','Date','Open','High','Low','Close','Adj Close','Volume']
+    Download OHLCV from Yahoo Finance.
+
+    Parameters
+    ----------
+    ticker : str
+        Symbol like "SPY".
+    start : str (YYYY-MM-DD)
+    end   : str (YYYY-MM-DD) or None
+    interval : one of {"1d","1wk","1mo"}
+    auto_adjust : bool
+        Adjust OHLC for splits/dividends.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: [Open, High, Low, Close, Adj Close, Volume]
+        Index name: "Date"
+        Empty DataFrame if nothing returned.
     """
-    if isinstance(tickers, str):
-        tickers = [tickers]
+    df = yf.download(
+        tickers=ticker,
+        start=start,
+        end=end,
+        interval=interval,
+        auto_adjust=auto_adjust,
+        progress=False,
+        threads=True,
+    )
 
-    if end is None:
-        end = dt.date.today().isoformat()
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
 
-    if source.lower() == "yahoo":
-        df = yf.download(
-            tickers=" ".join(tickers),
-            start=start,
-            end=end,
-            interval=interval,
-            auto_adjust=auto_adjust,
-            group_by="ticker",
-            threads=True,
-            progress=False,
-        )
-        if df.empty:
-            raise ValueError("No data downloaded from Yahoo. Check tickers or date range.")
-        return _tidy_from_wide(df, tickers)
+    # yfinance sometimes returns a column MultiIndex for multi-ticker queries.
+    # We force a flat frame for single ticker usage.
+    if isinstance(df.columns, pd.MultiIndex):
+        df = df.xs(ticker, axis=1, level=0)
 
-    elif source.lower() == "stooq":
-        frames = []
-        for t in tickers:
-            stooq_t = f"{t.lower()}.us"  # Stooq US suffix
-            sub = yf.download(
-                stooq_t,
-                start=start,
-                end=end,
-                interval=interval,
-                auto_adjust=auto_adjust,
-                progress=False,
-            )
-            if sub.empty:
-                continue
-            sub.columns = [c.title() for c in sub.columns]
-            sub["Ticker"] = t
-            frames.append(sub.reset_index())
-        if not frames:
-            raise ValueError("No data downloaded from Stooq for provided tickers.")
-        out = pd.concat(frames, ignore_index=True).rename(columns={"Date": "Date"})
-        cols = ["Ticker", "Date", "Open", "High", "Low", "Close", "Adj Close", "Volume"]
-        out = out[cols].sort_values(["Ticker", "Date"]).reset_index(drop=True)
-        return out
-
-    else:
-        raise ValueError("source must be 'yahoo' or 'stooq'")
+    df.index = pd.to_datetime(df.index)
+    df.index.name = "Date"
+    return df
