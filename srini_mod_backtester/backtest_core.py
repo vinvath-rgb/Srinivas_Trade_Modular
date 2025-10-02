@@ -1,198 +1,176 @@
-# srini_mod_backtester/data_loader.py
+# srini_mod_backtester/backtest_core.py
 from __future__ import annotations
 
-import time
-from typing import Dict, List, Optional
-from datetime import datetime
-import requests
+from typing import Dict, Tuple, Literal
+import numpy as np
 import pandas as pd
-import yfinance as yf
 
+# our package modules
+from .indicators import sma, rsi, atr
+from .sizing import target_vol_leverage, position
+from .utils import annualize_return, sharpe_ratio, max_drawdown  # ensure these exist in utils
 
-# ---------- helpers -----------------------------------------------------------
+StrategyName = Literal["SMA Crossover", "RSI Mean Reversion"]
 
-def _yf_session() -> requests.Session:
+# ---------- signal builders ----------
+
+def _signal_sma(df: pd.DataFrame, fast: int = 20, slow: int = 100, long_only: bool = True) -> pd.Series:
+    f = sma(df["Adj Close"], fast)
+    s = sma(df["Adj Close"], slow)
+    sig = np.where(f > s, 1.0, (-1.0 if not long_only else 0.0))
+    # execute on next bar to avoid lookahead
+    return pd.Series(sig, index=df.index).shift(1).fillna(0.0)
+
+def _signal_rsi(df: pd.DataFrame, lookback: int = 14, buy_lt: float = 30, sell_gt: float = 70, long_only: bool = True) -> pd.Series:
+    r = rsi(df["Adj Close"], lookback)
+    sig = np.where(r < buy_lt, 1.0,
+                   np.where(r > sell_gt, (-1.0 if not long_only else 0.0), np.nan))
+    # carry last decision forward; flat when no prior
+    out = pd.Series(sig, index=df.index).ffill().fillna(0.0)
+    # execute on next bar
+    return out.shift(1).fillna(0.0)
+
+# ---------- simple ATR-based exits (optional) ----------
+
+def _apply_exits(
+    df: pd.DataFrame,
+    raw_pos: pd.Series,
+    atr_mult_stop: float | None,
+    atr_mult_tp: float | None,
+    atr_lookback: int = 14,
+) -> pd.Series:
     """
-    Build a plain requests.Session with a desktop User-Agent.
-    Newer yfinance versions no longer expose utils.get_yf_ratelimit_session().
+    Convert intended position (raw_pos) into executed position using ATR stop / take-profit.
+    If no ATR rules are provided, returns raw_pos unchanged.
     """
-    s = requests.Session()
-    s.headers.update({"User-Agent": "Mozilla/5.0"})
-    return s
+    if (atr_mult_stop is None) and (atr_mult_tp is None):
+        return raw_pos
 
+    tr_atr = atr(df["High"], df["Low"], df["Close"], atr_lookback).reindex(df.index).fillna(method="ffill")
+    pos = raw_pos.copy().fillna(0.0)
+    exec_pos = pos.copy()
 
-def _normalize_prices(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    in_pos = 0.0
+    entry = np.nan
+    for i in range(len(df)):
+        px = df["Close"].iat[i]
+        desired = pos.iat[i]
+        this_atr = tr_atr.iat[i]
+
+        # open or flip
+        if desired != in_pos:
+            in_pos = desired
+            entry = px if in_pos != 0 else np.nan
+            exec_pos.iat[i] = in_pos
+            continue
+
+        # manage open position
+        if in_pos != 0 and not np.isnan(entry):
+            # stops only if provided
+            stop_hit = False
+            tp_hit = False
+            if atr_mult_stop is not None:
+                if in_pos > 0 and px <= entry - atr_mult_stop * this_atr:
+                    stop_hit = True
+                if in_pos < 0 and px >= entry + atr_mult_stop * this_atr:
+                    stop_hit = True
+            if atr_mult_tp is not None:
+                if in_pos > 0 and px >= entry + atr_mult_tp * this_atr:
+                    tp_hit = True
+                if in_pos < 0 and px <= entry - atr_mult_tp * this_atr:
+                    tp_hit = True
+            if stop_hit or tp_hit:
+                in_pos = 0.0
+                entry = np.nan
+
+        exec_pos.iat[i] = in_pos
+
+    return exec_pos
+
+# ---------- core backtest ----------
+
+def backtest_one(
+    df: pd.DataFrame,
+    strategy: StrategyName,
+    params: Dict | None = None,
+    vol_target: float = 0.15,          # annualized target vol (e.g., 0.15 = 15%)
+    atr_stop: float | None = None,     # e.g., 3.0 for 3×ATR stop
+    take_profit: float | None = None,  # e.g., 6.0 for 6×ATR take profit
+    long_only: bool = True,
+) -> Tuple[pd.DataFrame, Dict]:
     """
-    Accepts either a single-level OHLCV frame or a yfinance multi-index frame.
-    Returns: columns = [Open, High, Low, Close, Adj Close, Volume] for one ticker.
+    Runs a single-ticker backtest.
+    df columns: ['Open','High','Low','Close','Adj Close','Volume']; DateTimeIndex
+    Returns: (bar-level dataframe, summary metrics dict)
     """
-    if isinstance(df.columns, pd.MultiIndex):
-        # yfinance multi-index: (field, ticker) or (ticker, field)
-        if ticker in df.columns.levels[1]:
-            out = df.xs(ticker, axis=1, level=1).copy()       # (field, ticker)
-        elif ticker in df.columns.levels[0]:
-            out = df[ticker].copy()                            # (ticker, field)
-        else:
-            raise KeyError(f"Ticker {ticker} not in downloaded frame.")
+    params = params or {}
+
+    df = df.sort_index().copy()
+    # daily simple returns on adj close
+    ret = df["Adj Close"].pct_change().fillna(0.0)
+
+    # signals
+    if strategy == "SMA Crossover":
+        fast = int(params.get("fast", 20))
+        slow = int(params.get("slow", 100))
+        sig = _signal_sma(df, fast=fast, slow=slow, long_only=long_only)
+        sig_name = f"SMA[{fast}>{slow}]"
+    elif strategy == "RSI Mean Reversion":
+        lb = int(params.get("lookback", 14))
+        buy_lt = float(params.get("buy_lt", 30))
+        sell_gt = float(params.get("sell_gt", 70))
+        sig = _signal_rsi(df, lookback=lb, buy_lt=buy_lt, sell_gt=sell_gt, long_only=long_only)
+        sig_name = f"RSI[{lb}] {buy_lt}/{sell_gt}"
     else:
-        out = df.copy()
+        raise ValueError(f"Unknown strategy: {strategy}")
 
-    # Standardize column names/casing
-    rename_map = {c: c.title() for c in out.columns}
-    out = out.rename(columns=rename_map)
+    # volatility targeting (ex-ante, rolling realized)
+    span = int(params.get("vol_span", 20))
+    lev = target_vol_leverage(ret, vol_target=vol_target, span=span)  # capped inside
+    pre_exec_pos = position(sig, lev)  # shift + scale
 
-    # Ensure all required columns exist
-    for col in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
-        if col not in out.columns:
-            if col == "Adj Close" and "Close" in out.columns:
-                out[col] = out["Close"]
-            else:
-                out[col] = pd.NA
+    # optional ATR exits
+    exec_pos = _apply_exits(df, pre_exec_pos, atr_stop, take_profit)
 
-    # Order columns
-    out = out[["Open", "High", "Low", "Close", "Adj Close", "Volume"]]
-    return out
+    # bar PnL
+    pnl = exec_pos * ret
+    equity = (1.0 + pnl).cumprod()
 
+    # realized rolling daily vol (EWMA) for reporting
+    realized_vol = ret.ewm(span=span, adjust=False).std() * np.sqrt(252)
 
-def _to_datestr(x: str | datetime) -> str:
-    if isinstance(x, datetime):
-        return x.strftime("%Y-%m-%d")
-    return str(x)
+    # exposure = fraction of days when position != 0
+    exposure = float((exec_pos != 0).sum() / len(exec_pos)) if len(exec_pos) else 0.0
 
+    # summary metrics
+    cagr = annualize_return(pnl)
+    shrp = sharpe_ratio(pnl)
+    maxdd = max_drawdown(equity)
 
-# ---------- Yahoo (primary) ---------------------------------------------------
+    stats = {
+        "Strategy": strategy,
+        "Signal": sig_name,
+        "VolTarget": float(vol_target),
+        "ATR_Stop": (None if atr_stop is None else float(atr_stop)),
+        "TP_ATR": (None if take_profit is None else float(take_profit)),
+        "Exposure": round(exposure, 3),
+        "CAGR": round(float(cagr), 4),
+        "Sharpe": round(float(shrp), 2),
+        "MaxDD": round(float(maxdd), 4),
+        "LastEquity": round(float(equity.iloc[-1]), 4),
+        "Bars": int(len(df)),
+        "TradesApprox": int((np.abs(np.diff(exec_pos.values)) > 0).sum()),  # rough count of flips/opens/closes
+    }
 
-def _fetch_yahoo(
-    ticker: str,
-    start: str | datetime,
-    end: str | datetime,
-    tries: int = 2,
-    pause: float = 1.0,
-) -> pd.DataFrame:
-    """
-    Robust single-ticker fetch from Yahoo using yfinance with a custom Session.
-    Returns a normalized OHLCV DataFrame (may be empty if nothing returned).
-    """
-    s = _yf_session()
-    start_s = _to_datestr(start)
-    end_s = _to_datestr(end)
+    out = pd.DataFrame({
+        "Return": ret,
+        "RealizedVol": realized_vol,
+        "Leverage": lev,
+        "Signal": sig,
+        "PreExecPosition": pre_exec_pos,
+        "Position": exec_pos,
+        "PnL": pnl,
+        "Equity": equity,
+    }, index=df.index)
 
-    last_exc: Optional[Exception] = None
-    for _ in range(max(1, tries)):
-        try:
-            df = yf.download(
-                tickers=ticker,
-                start=start_s,
-                end=end_s,
-                interval="1d",
-                auto_adjust=False,
-                progress=False,
-                group_by="ticker",
-                threads=False,           # safer on some hosts
-                session=s,
-            )
-            if df is None or len(df) == 0:
-                # sometimes Yahoo responds but with no rows
-                last_exc = None
-            else:
-                df = _normalize_prices(df, ticker)
-                # Clean index
-                df.index = pd.to_datetime(df.index)
-                df = df.sort_index()
-                return df
-        except Exception as e:
-            last_exc = e
-        time.sleep(pause)
-
-    # If we get here, either empty or error every time
-    if last_exc:
-        print(f"[Yahoo] {ticker} failed: {last_exc}")
-    return pd.DataFrame()
-
-
-# ---------- Stooq (fallback) --------------------------------------------------
-
-def _stooq_symbol(ticker: str) -> str:
-    """
-    Build a Stooq symbol. For most US tickers: lower-case + '.us' (e.g., spy.us).
-    This is a heuristic; Stooq coverage is limited for non-US markets.
-    """
-    t = ticker.strip().lower()
-    if "." in t:   # e.g., 'brk.b' or exchange suffixes — leave as is and try
-        return t
-    return f"{t}.us"
-
-
-def _fetch_stooq(
-    ticker: str,
-    start: str | datetime,
-    end: str | datetime,
-) -> pd.DataFrame:
-    """
-    Simple Stooq fetch via CSV. Returns normalized OHLCV (Adj Close = Close).
-    """
-    sym = _stooq_symbol(ticker)
-    url = f"https://stooq.com/q/d/l/?s={sym}&i=d"
-    try:
-        df = pd.read_csv(url)
-        if df.empty:
-            return pd.DataFrame()
-
-        df["Date"] = pd.to_datetime(df["Date"])
-        df = df.set_index("Date").sort_index()
-        # rename to standard
-        df = df.rename(columns={
-            "Open": "Open",
-            "High": "High",
-            "Low": "Low",
-            "Close": "Close",
-            "Volume": "Volume",
-        })
-        # fill Adj Close = Close
-        df["Adj Close"] = df["Close"]
-        df = df[["Open", "High", "Low", "Close", "Adj Close", "Volume"]]
-
-        # date slice to requested range
-        df = df.loc[_to_datestr(start):_to_datestr(end)]
-        return df
-    except Exception as e:
-        print(f"[Stooq] {ticker} failed: {e}")
-        return pd.DataFrame()
-
-
-# ---------- Public API --------------------------------------------------------
-
-def load_adj_close(
-    tickers: List[str],
-    start: str | datetime,
-    end: str | datetime,
-    prefer: str = "yahoo",  # "yahoo" -> Stooq fallback
-) -> Dict[str, pd.DataFrame]:
-    """
-    Fetch daily OHLCV for each ticker between start and end (inclusive range),
-    normalized to columns: [Open, High, Low, Close, Adj Close, Volume].
-
-    Returns: dict[ticker] -> DataFrame (may be empty if all sources failed).
-    """
-    out: Dict[str, pd.DataFrame] = {}
-
-    for t in tickers:
-        t = t.strip()
-        df = pd.DataFrame()
-
-        if prefer.lower() == "yahoo":
-            df = _fetch_yahoo(t, start, end)
-            if df.empty:
-                # fallback to Stooq (best effort for US symbols)
-                df = _fetch_stooq(t, start, end)
-        else:
-            # Stooq first, then Yahoo
-            df = _fetch_stooq(t, start, end)
-            if df.empty:
-                df = _fetch_yahoo(t, start, end)
-
-        if df.empty:
-            print(f"[DataLoader] No data for {t} from Yahoo or Stooq.")
-        out[t] = df
-
-    return out
+    return out, stats
