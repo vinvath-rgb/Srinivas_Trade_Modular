@@ -1,22 +1,17 @@
+# srini_mod_backtester/indicators.py
+from __future__ import annotations
 import pandas as pd
 
 def sma(series: pd.Series, window: int) -> pd.Series:
-    return series.rolling(window=window).mean()
+    return series.rolling(window, min_periods=window).mean()
 
-def rsi(series: pd.Series, window: int = 14) -> pd.Series:
+def rsi(series: pd.Series, lookback: int = 14) -> pd.Series:
+    # Wilder RSI
     delta = series.diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = -delta.where(delta < 0, 0.0)
-    avg_gain = gain.rolling(window=window).mean()
-    avg_loss = loss.rolling(window=window).mean()
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-def atr(df: pd.DataFrame, window: int = 14) -> pd.Series:
-    """Average True Range for volatility-based stops."""
-    high_low = df["High"] - df["Low"]
-    high_close = (df["High"] - df["Close"].shift()).abs()
-    low_close = (df["Low"] - df["Close"].shift()).abs()
-    ranges = pd.concat([high_low, high_close, low_close], axis=1)
-    true_range = ranges.max(axis=1)
-    return true_range.rolling(window=window).mean()
+    up = delta.clip(lower=0)
+    down = (-delta).clip(lower=0)
+    roll_up = up.ewm(alpha=1/lookback, adjust=False).mean()
+    roll_down = down.ewm(alpha=1/lookback, adjust=False).mean()
+    rs = roll_up / (roll_down + 1e-12)
+    rsi_val = 100 - (100 / (1 + rs))
+    return rsi_val
