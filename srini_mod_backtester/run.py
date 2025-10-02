@@ -5,7 +5,7 @@ import pandas as pd
 from typing import Dict
 
 from .data_loader import load_adj_close
-from .backtest_core import backtest_one as run_backtest
+from .backtest_core import backtest_one
 
 def main():
     st.set_page_config(page_title="US Backtester (Srini) – Modular", layout="wide")
@@ -64,7 +64,7 @@ def main():
     curves = {}
     rows = []
     for t, df in prices.items():
-        result_df, metrics = run_backtest(
+        result_df, metrics = backtest_one(
             df=df,
             strategy=strat,
             params=params,
