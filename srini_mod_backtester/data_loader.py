@@ -14,7 +14,8 @@ import yfinance as yf
 # ---- Robust Yahoo → Stooq fetch ---------------------------------------------
 
 def _yf_session():
-    s = yf.utils.get_yf_ratelimit_session()  # has backoff
+ #   s = yf.utils.get_yf_ratelimit_session()  # has backoff
+    s = requests.Session()
     # add UA to reduce chance of HTML error pages
     s.headers.update({"User-Agent": "Mozilla/5.0 (compatible; SriniBacktester/1.0)"})
     return s
