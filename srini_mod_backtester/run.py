@@ -5,7 +5,7 @@ import pandas as pd
 from typing import Dict
 
 from .data_loader import load_adj_close
-from .backtest_core import run_backtest
+from .backtest_core import backtest_one as run_backtest
 
 def main():
     st.set_page_config(page_title="US Backtester (Srini) – Modular", layout="wide")
