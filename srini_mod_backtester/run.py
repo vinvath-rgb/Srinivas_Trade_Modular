@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 from .data_loader import load_adj_close
-from .backtest_core import run_backtest
+from .backtest_core import backtest_one as run_backtest
 from .excel_export import to_excel
 
 def main():
