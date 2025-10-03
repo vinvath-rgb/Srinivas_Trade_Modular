@@ -9,7 +9,7 @@ import streamlit as st
 from datetime import date
 
 # --- use package modules ---
-from srini_mod_backtester.data_loader import load_prices_yahoo
+from srini_mod_backtester.data_loader import load_prices
 from srini_mod_backtester.signals import sma_crossover, rsi_meanrev
 from srini_mod_backtester.backtest_core import equity_curve_long_only  # your existing engine
 
